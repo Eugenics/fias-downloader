@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -123,8 +124,10 @@ func (d *Downloader) attempt(ctx context.Context, url, destPath string, onProgre
 	}
 
 	offset := fileSize(destPath)
+	var totalBytes int64
 	if offset > 0 {
-		canResume, probeErr := d.canResume(ctx, url, offset)
+		canResume, remoteTotal, probeErr := d.canResume(ctx, url, offset)
+		totalBytes = remoteTotal
 		if probeErr != nil {
 			if d.log != nil {
 				d.log.Warn("resume probe failed, proceeding with wget --continue", "error", probeErr, "url", url, "offset", offset)
@@ -137,6 +140,9 @@ func (d *Downloader) attempt(ctx context.Context, url, destPath string, onProgre
 				return Result{}, fmt.Errorf("remove stale partial file: %w", err)
 			}
 		}
+	}
+	if totalBytes <= 0 {
+		totalBytes = d.probeTotal(ctx, url)
 	}
 
 	readTimeoutSec := int64(d.opts.StallTimeout.Seconds())
@@ -166,7 +172,7 @@ func (d *Downloader) attempt(ctx context.Context, url, destPath string, onProgre
 
 	errCh := make(chan error, 1)
 	if onProgress != nil {
-		onProgress(fileSize(destPath), 0)
+		onProgress(fileSize(destPath), totalBytes)
 	}
 	go func() {
 		errCh <- cmd.Run()
@@ -213,7 +219,7 @@ func (d *Downloader) attempt(ctx context.Context, url, destPath string, onProgre
 				lastGrowthAt = time.Now()
 			}
 			if onProgress != nil {
-				onProgress(sz, 0)
+				onProgress(sz, totalBytes)
 			}
 			if time.Since(lastGrowthAt) >= d.opts.StallTimeout {
 				if cmd.Process != nil {
@@ -226,31 +232,66 @@ func (d *Downloader) attempt(ctx context.Context, url, destPath string, onProgre
 	}
 }
 
-func (d *Downloader) canResume(ctx context.Context, url string, offset int64) (bool, error) {
+func (d *Downloader) canResume(ctx context.Context, url string, offset int64) (bool, int64, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, d.probeClient.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return false, fmt.Errorf("build resume probe request: %w", err)
+		return false, 0, fmt.Errorf("build resume probe request: %w", err)
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 
 	resp, err := d.probeClient.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("execute resume probe request: %w", err)
+		return false, 0, fmt.Errorf("execute resume probe request: %w", err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.CopyN(io.Discard, resp.Body, 1)
 
+	total := totalFromResponse(resp)
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		return true, nil
+		return true, total, nil
 	case http.StatusOK, http.StatusRequestedRangeNotSatisfiable:
-		return false, nil
+		return false, total, nil
 	default:
-		return false, fmt.Errorf("unexpected resume probe status: %d", resp.StatusCode)
+		return false, total, fmt.Errorf("unexpected resume probe status: %d", resp.StatusCode)
 	}
+}
+
+// probeTotal получает полный размер объекта однобайтовым Range-запросом.
+func (d *Downloader) probeTotal(ctx context.Context, url string) int64 {
+	probeCtx, cancel := context.WithTimeout(ctx, d.probeClient.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := d.probeClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	_, _ = io.CopyN(io.Discard, resp.Body, 1)
+	return totalFromResponse(resp)
+}
+
+func totalFromResponse(resp *http.Response) int64 {
+	if contentRange := resp.Header.Get("Content-Range"); contentRange != "" {
+		if slash := strings.LastIndexByte(contentRange, '/'); slash >= 0 {
+			total, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
+			if err == nil && total >= 0 {
+				return total
+			}
+		}
+	}
+	if resp.ContentLength >= 0 {
+		return resp.ContentLength
+	}
+	return 0
 }
 
 func fileSHA256(path string) (int64, string, error) {

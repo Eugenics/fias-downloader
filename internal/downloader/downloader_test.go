@@ -67,8 +67,12 @@ func TestDownload_Resume(t *testing.T) {
 	d := New(nil, Options{MaxRetries: 1, RetryBaseDelay: time.Millisecond, StallTimeout: 5 * time.Second, ProgressEvery: 20 * time.Millisecond})
 
 	var lastDownloaded, lastTotal int64
+	var totalSeenDuringDownload bool
 	res, err := d.Download(context.Background(), srv.URL, dest, func(downloaded, total int64) {
 		lastDownloaded, lastTotal = downloaded, total
+		if downloaded < int64(len(content)) && total == int64(len(content)) {
+			totalSeenDuringDownload = true
+		}
 	})
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
@@ -92,6 +96,9 @@ func TestDownload_Resume(t *testing.T) {
 	}
 	if lastDownloaded != int64(len(content)) || lastTotal != int64(len(content)) {
 		t.Fatalf("unexpected final progress: downloaded=%d total=%d", lastDownloaded, lastTotal)
+	}
+	if !totalSeenDuringDownload {
+		t.Fatal("expected full file size in progress before download completed")
 	}
 }
 
