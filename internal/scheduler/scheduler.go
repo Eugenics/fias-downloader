@@ -158,13 +158,20 @@ func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kin
 	log.Info("starting download")
 
 	onProgress := func(downloaded, total int64) {
-		if err := s.repo.UpdateProgress(ctx, rec.ID, downloaded, total); err != nil {
+		progressCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := s.repo.UpdateProgress(progressCtx, rec.ID, downloaded, total); err != nil {
 			log.Warn("failed to persist progress", "error", err)
 		}
 	}
 
 	doneFn := s.metrics.DownloadStarted(string(kind))
 	defer doneFn()
+	// Публикуем начальный прогресс сразу, ещё до получения первого блока
+	// данных. Это позволяет dashboard показывать активную загрузку даже при
+	// медленном или временно зависшем соединении.
+	s.metrics.SetDownloadProgress(string(kind), sv.VersionID, 0, 0)
+	defer s.metrics.ClearDownloadProgress(string(kind), sv.VersionID)
 	dlStart := time.Now()
 
 	result, dlErr := s.downloader.Download(ctx, url, destPath, onProgress)

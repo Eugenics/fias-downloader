@@ -22,7 +22,7 @@ internal/config                — загрузка и валидация кон
 internal/model                 — модели: SourceVersion (ответ источника), DownloadRecord (строка БД)
 internal/fetcher                — клиент GetAllDownloadFileInfo
 internal/repo                   — репозиторий PostgreSQL (таблица version_info)
-internal/downloader               — потоковая загрузка с докачкой (Range) и ретраями
+internal/downloader               — загрузка через wget (--continue) с докачкой и ретраями
 internal/scheduler                 — бизнес-логика выбора версий + оркестрация загрузки
 internal/api                        — HTTP API ручного управления + /metrics
 internal/metrics                     — Prometheus-метрики
@@ -51,10 +51,10 @@ source:
 
 download:
   dir: "./data/downloads"
-  stall_timeout: "2m"
-  max_retries: 5
+  stall_timeout: "10m"
+  max_retries: 15
   retry_base_delay: "5s"
-  progress_save_interval: "5s"
+  progress_save_interval: "30s"
 
 http:
   listen_addr: ":8080"
@@ -162,6 +162,8 @@ go run ./cmd/fias-downloader
 | `fias_download_bytes_total` | counter | `kind` | суммарно загруженных байт |
 | `fias_download_duration_seconds` | histogram | `kind` | длительность загрузки файла |
 | `fias_download_in_progress` | gauge | `kind` | загрузок выполняется прямо сейчас |
+| `fias_download_progress_downloaded_bytes` | gauge | `kind`, `version_id` | уже загружено байт для текущей загрузки |
+| `fias_download_progress_total_bytes` | gauge | `kind`, `version_id` | ожидаемый размер текущей загрузки |
 | `fias_last_completed_version_id` | gauge | `kind` | `VersionId` последней успешной загрузки |
 | `fias_last_cycle_timestamp_seconds` | gauge | — | unix-время завершения последнего цикла |
 

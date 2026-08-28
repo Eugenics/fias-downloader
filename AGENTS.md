@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-This repository contains a Go microservice that downloads FIAS/GAR address-reference full and delta archives, persists download state and logs in PostgreSQL, exposes an HTTP control API and Prometheus metrics, and runs as a Docker Compose stack.
+This repository contains a Go microservice that downloads FIAS/GAR address-reference full and delta archives, persists download state and logs in PostgreSQL, exposes an HTTP control API and Prometheus metrics, and runs as a Docker Compose stack with Grafana.
 
 ## Project Structure & Module Organization
 
@@ -17,9 +17,9 @@ This repository contains a Go microservice that downloads FIAS/GAR address-refer
   - `logstore/` asynchronous PostgreSQL `slog.Handler` and tee handler
 - `migrations/` SQL schema (`0001_init.sql` for `version_info`, `0002_logs.sql` for `logs`). Schemas are also ensured automatically at startup.
 - `config.example.yaml` — local configuration template; copy it to the ignored `config.yaml`.
-- `deploy/config.docker.yaml` — configuration mounted by Compose; `deploy/prometheus/prometheus.yml` configures scraping.
-- `docker-compose.yml`, `Dockerfile` — PostgreSQL, service, and Prometheus stack.
-- Runtime archives are stored under the configured download directory (default `./data/downloads`); keep runtime data out of git.
+- `deploy/config.docker.yaml` — configuration mounted by Compose; `deploy/prometheus/prometheus.yml` configures scraping; `deploy/grafana/` contains provisioning and the dashboard.
+- `docker-compose.yml`, `Dockerfile`, `entrypoint.sh` — containerization and bind-mount permission setup.
+- Runtime archives are stored under `./var/data/downloads`; keep runtime data out of git.
 
 ## Build, Test, and Development Commands
 
@@ -28,15 +28,17 @@ This repository contains a Go microservice that downloads FIAS/GAR address-refer
 - `go fmt ./...` — format Go code.
 - `go vet ./...` — basic static checks.
 - `docker compose up --build` — build and run the full stack.
+- `docker compose down -v && docker compose up --build` — discard old Compose volumes and recreate the stack when migrating from the earlier downloads volume layout.
 
-The Docker build uses vendored dependencies and runs `CGO_ENABLED=0 go build -mod=vendor -o /out/fias-downloader ./cmd/fias-downloader` inside the builder image.
+The Docker build uses vendored dependencies and runs `CGO_ENABLED=0 go build -mod=vendor -o /out/fias-downloader ./cmd/fias-downloader` inside the builder image. No Makefile or repository CI workflow is present.
 
 ## Configuration & Runtime
 
 - The service reads YAML only. It defaults to `config.yaml` in the current working directory; `--config /path/to/config.yaml` or `FIAS_CONFIG_PATH` selects another file. `FIAS_CONFIG_PATH` is the only environment-variable override.
 - Required startup values are `postgres.dsn`, non-empty `source.url`, `download.dir`, `http.listen_addr`, and a positive `scheduler.poll_interval`. Duration fields use strings such as `30s`, `2m`, and `6h`.
-- Compose mounts `deploy/config.docker.yaml` at `/app/config.yaml`, exposes service `8080`, PostgreSQL `5432`, and Prometheus `9090`, and persists named volumes `pgdata`, `downloads`, and `prometheus-data`.
+- Compose mounts `deploy/config.docker.yaml` at `/app/config.yaml`. Host ports are `5431` (PostgreSQL), `8888` (service), `9999` (Prometheus), and `3000` (Grafana); named volumes persist PostgreSQL, Prometheus, and Grafana data.
 - Large downloads intentionally use an HTTP client with no whole-request timeout; `download.stall_timeout` detects an inactive stream. Interrupted files are resumed with `Range`; a `200` response to a ranged request truncates and restarts the file.
+- The container entrypoint creates `/app/data/downloads`, assigns it to uid 10001 user `app`, then starts the service unprivileged. Do not manually `chmod` the host download directory.
 
 ## Coding Style & Naming Conventions
 
@@ -65,7 +67,7 @@ The Docker build uses vendored dependencies and runs `CGO_ENABLED=0 go build -mo
 
 ## Pitfalls
 
-- Do not commit `config.yaml` or `/data/`; both are ignored. Do not put secrets in tracked example/deploy config files.
+- Do not commit `config.yaml`, `/data/`, or downloaded files under `/var/data/downloads/`; these are ignored. Do not put secrets in tracked example/deploy config files. The Compose example currently contains default Grafana credentials (`admin` / `admin`), which must be changed outside local development.
 - The service requires reachable PostgreSQL and validates configuration before startup; Compose waits for PostgreSQL health before starting the service.
 - A manual trigger and the scheduled cycle share a process-local lock; a concurrent cycle is skipped. Multiple service replicas are not protected by a distributed lock.
-- `logs` has no built-in retention/rotation, and downloaded archives use local/volume storage only.
+- `logs` has no built-in retention/rotation, and downloaded archives use local bind-mount storage only.

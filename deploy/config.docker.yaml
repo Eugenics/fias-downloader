@@ -10,10 +10,10 @@ source:
 
 download:
   dir: "/app/data/downloads"
-  stall_timeout: "2m"
-  max_retries: 5
+  stall_timeout: "10m"
+  max_retries: 15
   retry_base_delay: "5s"
-  progress_save_interval: "5s"
+  progress_save_interval: "30s"
 
 http:
   listen_addr: ":8080"

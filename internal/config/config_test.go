@@ -34,8 +34,14 @@ postgres:
 	if cfg.Download.Dir != "./data/downloads" {
 		t.Errorf("unexpected default download.dir: %q", cfg.Download.Dir)
 	}
-	if cfg.Download.MaxRetries != 5 {
+	if cfg.Download.StallTimeout.Duration != 10*time.Minute {
+		t.Errorf("unexpected default download.stall_timeout: %v", cfg.Download.StallTimeout.Duration)
+	}
+	if cfg.Download.MaxRetries != 15 {
 		t.Errorf("unexpected default download.max_retries: %d", cfg.Download.MaxRetries)
+	}
+	if cfg.Download.ProgressSaveInterval.Duration != 30*time.Second {
+		t.Errorf("unexpected default download.progress_save_interval: %v", cfg.Download.ProgressSaveInterval.Duration)
 	}
 	if cfg.HTTP.ListenAddr != ":8080" {
 		t.Errorf("unexpected default http.listen_addr: %q", cfg.HTTP.ListenAddr)

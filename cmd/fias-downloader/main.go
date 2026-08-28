@@ -96,6 +96,7 @@ func run(bootLogger *slog.Logger) error {
 		RetryBaseDelay: cfg.Download.RetryBaseDelay.Duration,
 		StallTimeout:   cfg.Download.StallTimeout.Duration,
 		ProgressEvery:  cfg.Download.ProgressSaveInterval.Duration,
+		Logger:         logger,
 	})
 	// Таймаут на весь запрос намеренно не задаётся (Timeout: 0) — загрузка
 	// больших архивов может занимать долго; вместо этого используется

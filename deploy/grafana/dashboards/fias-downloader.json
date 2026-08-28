@@ -239,7 +239,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "count(fias_download_progress_total_bytes)",
+          "expr": "sum(fias_download_in_progress)",
           "legendFormat": "активных загрузок",
           "refId": "A"
         }
@@ -266,6 +266,135 @@
         }
       ],
       "fieldConfig": { "defaults": { "unit": "decbytes" }, "overrides": [] }
+    },
+    {
+      "id": 16,
+      "title": "Активных full-загрузок",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(fias_download_in_progress{kind=\"full\"})",
+          "legendFormat": "full",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 17,
+      "title": "Активных delta-загрузок",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(fias_download_in_progress{kind=\"delta\"})",
+          "legendFormat": "delta",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 18,
+      "title": "Завершено загрузок за период",
+      "type": "stat",
+      "description": "Количество завершённых загрузок full и delta за период дашборда.",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(fias_download_total[$__range]))",
+          "legendFormat": "загрузок",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 19,
+      "title": "Успешность загрузок за период",
+      "type": "stat",
+      "description": "Доля успешных загрузок от всех завершённых загрузок за период дашборда.",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * sum(increase(fias_download_total{result=\"success\"}[$__range])) / clamp_min(sum(increase(fias_download_total[$__range])), 1)",
+          "legendFormat": "успешно",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 95 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "title": "Текущая скорость загрузки",
+      "type": "stat",
+      "description": "Суммарная скорость активных загрузок за последние 5 минут.",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(fias_download_progress_downloaded_bytes[5m]))",
+          "legendFormat": "байт/с",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "decimals": 1 }, "overrides": [] }
+    },
+    {
+      "id": 21,
+      "title": "Осталось до завершения текущих загрузок",
+      "type": "stat",
+      "description": "Оценка по текущему объёму и средней скорости за последние 5 минут. Пусто при отсутствии активной загрузки.",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(fias_download_progress_total_bytes - fias_download_progress_downloaded_bytes) / clamp_min(sum(rate(fias_download_progress_downloaded_bytes[5m])), 1)",
+          "legendFormat": "ETA",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 22,
+      "title": "Процент прогресса по активным загрузкам",
+      "type": "timeseries",
+      "description": "Процент загруженных байт для каждой активной версии.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * fias_download_progress_downloaded_bytes / clamp_min(fias_download_progress_total_bytes, 1)",
+          "legendFormat": "{{kind}} v{{version_id}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 },
+        "overrides": []
+      }
     }
   ]
 }

@@ -93,10 +93,10 @@ func defaults() Config {
 		},
 		Download: DownloadConfig{
 			Dir:                  "./data/downloads",
-			StallTimeout:         Duration{2 * time.Minute},
-			MaxRetries:           5,
+			StallTimeout:         Duration{10 * time.Minute},
+			MaxRetries:           15,
 			RetryBaseDelay:       Duration{5 * time.Second},
-			ProgressSaveInterval: Duration{5 * time.Second},
+			ProgressSaveInterval: Duration{30 * time.Second},
 		},
 		HTTP: HTTPConfig{
 			ListenAddr: ":8080",
