@@ -4,6 +4,7 @@
 package metrics
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -22,6 +23,9 @@ type Metrics struct {
 	downloadBytesTotal  *prometheus.CounterVec
 	downloadDuration    *prometheus.HistogramVec
 	downloadsInProgress *prometheus.GaugeVec
+
+	downloadProgressDownloadedBytes *prometheus.GaugeVec
+	downloadProgressTotalBytes      *prometheus.GaugeVec
 
 	lastVersion        *prometheus.GaugeVec
 	lastCycleTimestamp prometheus.Gauge
@@ -77,6 +81,19 @@ func New(reg *prometheus.Registry) *Metrics {
 			Help: "Количество загрузок файлов, выполняющихся в данный момент, по типу.",
 		}, []string{"kind"}),
 
+		downloadProgressDownloadedBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Subsystem: "download", Name: "progress_downloaded_bytes",
+			Help: "Сколько байт уже загружено для текущей выполняющейся загрузки (по версии и типу файла). " +
+				"Метрика существует, только пока соответствующая загрузка активна.",
+		}, []string{"kind", "version_id"}),
+
+		downloadProgressTotalBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Subsystem: "download", Name: "progress_total_bytes",
+			Help: "Ожидаемый общий размер файла текущей выполняющейся загрузки (по данным Content-Length), " +
+				"по версии и типу файла. 0, если сервер не сообщил размер. Метрика существует, только пока " +
+				"соответствующая загрузка активна.",
+		}, []string{"kind", "version_id"}),
+
 		lastVersion: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "last_completed_version_id",
 			Help: "VersionId последней успешно загруженной версии, по типу файла (full/delta).",
@@ -92,6 +109,7 @@ func New(reg *prometheus.Registry) *Metrics {
 		m.fetchTotal, m.fetchDuration,
 		m.cycleTotal, m.cycleDuration,
 		m.downloadsTotal, m.downloadBytesTotal, m.downloadDuration, m.downloadsInProgress,
+		m.downloadProgressDownloadedBytes, m.downloadProgressTotalBytes,
 		m.lastVersion, m.lastCycleTimestamp,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
@@ -140,4 +158,22 @@ func (m *Metrics) ObserveDownload(kind string, d time.Duration, bytes int64, err
 
 func (m *Metrics) SetLastCompletedVersion(kind string, versionID int64) {
 	m.lastVersion.WithLabelValues(kind).Set(float64(versionID))
+}
+
+// SetDownloadProgress обновляет "сколько уже загружено" / "сколько всего
+// ожидается" для конкретной активной загрузки. total может быть 0, если
+// сервер не сообщил размер файла (Content-Length).
+func (m *Metrics) SetDownloadProgress(kind string, versionID int64, downloaded, total int64) {
+	vid := strconv.FormatInt(versionID, 10)
+	m.downloadProgressDownloadedBytes.WithLabelValues(kind, vid).Set(float64(downloaded))
+	m.downloadProgressTotalBytes.WithLabelValues(kind, vid).Set(float64(total))
+}
+
+// ClearDownloadProgress убирает метрики прогресса для завершённой (успешно
+// или нет) загрузки — иначе в /metrics будут накапливаться gauge'и по всем
+// версиям, когда-либо загружавшимся, а не только по активным сейчас.
+func (m *Metrics) ClearDownloadProgress(kind string, versionID int64) {
+	vid := strconv.FormatInt(versionID, 10)
+	m.downloadProgressDownloadedBytes.DeleteLabelValues(kind, vid)
+	m.downloadProgressTotalBytes.DeleteLabelValues(kind, vid)
 }
