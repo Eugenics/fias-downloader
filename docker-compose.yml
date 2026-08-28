@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: fias
       POSTGRES_DB: fias
     ports:
-      - "5432:5432"
+      - "5431:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -24,22 +24,25 @@ services:
         condition: service_healthy
     volumes:
       - ./deploy/config.docker.yaml:/app/config.yaml:ro
-      - downloads:/app/data
+      - ./var/data/downloads:/app/data/downloads
     ports:
-      - "8080:8080"
+      - "8888:8080"
 
   prometheus:
     image: prom/prometheus:v2.53.0
     restart: unless-stopped
     depends_on:
       - fias-downloader
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      - "9999:9090"
 
 volumes:
   pgdata:
-  downloads:
   prometheus-data:
