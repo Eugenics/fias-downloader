@@ -1,0 +1,22 @@
+# Конфигурация fias-downloader для запуска через docker-compose.
+# Монтируется в контейнер как /app/config.yaml (см. docker-compose.yml).
+
+postgres:
+  dsn: "postgres://fias:fias@postgres:5432/fias?sslmode=disable"
+
+source:
+  url: "https://fias.nalog.ru/WebServices/Public/GetAllDownloadFileInfo"
+  http_timeout: "30s"
+
+download:
+  dir: "/app/data/downloads"
+  stall_timeout: "2m"
+  max_retries: 5
+  retry_base_delay: "5s"
+  progress_save_interval: "5s"
+
+http:
+  listen_addr: ":8080"
+
+scheduler:
+  poll_interval: "6h"

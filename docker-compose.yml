@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fias
+      POSTGRES_PASSWORD: fias
+      POSTGRES_DB: fias
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fias -d fias"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  fias-downloader:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./deploy/config.docker.yaml:/app/config.yaml:ro
+      - downloads:/app/data
+    ports:
+      - "8080:8080"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    depends_on:
+      - fias-downloader
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+volumes:
+  pgdata:
+  downloads:
+  prometheus-data:
