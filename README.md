@@ -1,45 +1,85 @@
 # fias-downloader
 
-Микросервис на Go для загрузки справочника адресов ФИАС/ГАР
-с `https://fias.nalog.ru/WebServices/Public/GetAllDownloadFileInfo`.
+Go-сервис для автоматической загрузки полных и дельта-архивов адресного
+справочника ФИАС/ГАР. Список доступных версий сервис получает через
+`GetAllDownloadFileInfo`, состояние хранит в PostgreSQL, а архивы — в локальной
+файловой системе.
 
-Реализовано согласно ТЗ:
+## Как работает сервис
 
-- если полной версии ещё нет — загружается последняя доступная полная версия (`GarXMLFullURL`);
-- если полная версия уже загружена — догружаются только недостающие delta-версии (`GarXMLDeltaURL`), идущие после неё, строго по возрастанию, без пропусков;
-- ручной эндпоинт для принудительной загрузки последней полной версии, даже если полная версия уже есть;
-- докачка прерванных загрузок через `wget --continue` (использует HTTP `Range`), с фолбэком на полную перезагрузку, если `Range` не поддерживается;
-- состояние всех загрузок (full/delta по каждой версии) хранится в PostgreSQL, таблица `version_info` (соответствует `versionInfo` из ТЗ);
-- **Prometheus-метрики** по HTTP `/metrics`;
-- **логи сервиса дублируются в PostgreSQL** (таблица `logs`), в дополнение к обычному JSON-выводу в stdout;
-- весь стек (сервис + PostgreSQL + Prometheus) поднимается одной командой через `docker compose`.
+При запуске сервис сразу выполняет цикл синхронизации, затем повторяет его с
+интервалом `scheduler.poll_interval`:
 
-## Структура проекта
+1. Получает список версий ФИАС/ГАР.
+2. Если завершённой полной версии ещё нет, загружает последнюю доступную full.
+3. Если full уже есть, последовательно загружает отсутствующие delta после неё.
+4. Сохраняет статус, объём, путь, SHA-256 и ошибки в `version_info`.
 
+Плановый и ручной циклы защищены общим process-local mutex: одновременно внутри
+одного экземпляра выполняется не более одного цикла. Для нескольких реплик
+распределённой блокировки нет.
+
+Загрузчик реализован на стандартном `net/http`:
+
+- данные пишутся в `<имя>.zip.part`;
+- незавершённый файл продолжается запросом `Range`;
+- `206 Partial Content` принимается только с корректным `Content-Range`;
+- если сервер отвечает `200 OK` на Range-запрос, `.part` очищается и загрузка
+  начинается заново;
+- ответ `416` считается успешным только когда размер `.part` совпадает с полным
+  размером из `Content-Range`;
+- отсутствие новых данных дольше `download.stall_timeout` прерывает попытку;
+- временные ошибки повторяются с экспоненциальной задержкой;
+- готовый файл синхронизируется, получает SHA-256 и атомарно переименовывается
+  из `.part` в итоговый `.zip`.
+
+Прогресс сохраняется в PostgreSQL с интервалом
+`download.progress_save_interval`. В интерактивном терминале одна строка
+прогресса обновляется каждые 5 секунд; в Docker stdout не является терминалом,
+поэтому каждое обновление выводится отдельной строкой и видно через
+`docker compose logs`.
+
+## Архитектура
+
+```text
+FIAS/GAR API
+    |
+    v
+fetcher -> scheduler -> downloader -> .zip.part -> .zip
+                |             |
+                v             v
+           PostgreSQL     текущие метрики
+          version_info     Prometheus
+              logs             |
+                               v
+                            Grafana
 ```
-cmd/fias-downloader/main.go   — точка входа: сборка зависимостей, логирование, graceful shutdown
-internal/config                — загрузка и валидация конфигурации из YAML-файла
-internal/model                 — модели: SourceVersion (ответ источника), DownloadRecord (строка БД)
-internal/fetcher                — клиент GetAllDownloadFileInfo
-internal/repo                   — репозиторий PostgreSQL (таблица version_info)
-internal/downloader               — загрузка через wget (--continue) с докачкой и ретраями
-internal/scheduler                 — бизнес-логика выбора версий + оркестрация загрузки
-internal/api                        — HTTP API ручного управления + /metrics
-internal/metrics                     — Prometheus-метрики
-internal/logstore                     — асинхронная запись логов в БД (slog.Handler) + TeeHandler
-migrations/0001_init.sql              — DDL таблицы version_info
-migrations/0002_logs.sql               — DDL таблицы logs
-config.example.yaml                     — образец конфигурации, скопировать в config.yaml
-deploy/config.docker.yaml                — конфигурация для запуска через docker-compose
-deploy/prometheus/prometheus.yml          — конфиг скрейпа для Prometheus
-deploy/grafana/                            — провижининг Grafana (источник данных + готовый дашборд)
-docker-compose.yml, Dockerfile             — контейнеризация всего стека
+
+Основные каталоги:
+
+```text
+cmd/fias-downloader/          точка входа и сборка зависимостей
+internal/api/                 health, metrics и ручные trigger-эндпоинты
+internal/config/              загрузка и валидация YAML
+internal/downloader/          HTTP-загрузка, resume, retry, stall detection, SHA-256
+internal/fetcher/             клиент GetAllDownloadFileInfo
+internal/logstore/            асинхронная запись slog в PostgreSQL
+internal/metrics/             метрики текущей загрузки
+internal/model/               модели источника и БД
+internal/repo/                PostgreSQL-репозиторий version_info
+internal/scheduler/           выбор full/delta и оркестрация
+migrations/                   SQL для version_info и logs
+deploy/config.docker.yaml     конфигурация сервиса в Compose
+deploy/prometheus/            конфигурация сбора метрик
+deploy/grafana/               provisioning и dashboard текущей загрузки
+var/data/downloads/           архивы при запуске через Compose
 ```
 
 ## Конфигурация
 
-Весь конфиг сервиса — в одном YAML-файле (структура и все ключи описаны в
-`config.example.yaml`):
+Сервис читает только YAML. По умолчанию требуется `config.yaml` в текущей
+директории. Другой путь задаётся флагом `--config` или переменной
+`FIAS_CONFIG_PATH`; это единственная поддерживаемая переменная окружения.
 
 ```yaml
 postgres:
@@ -63,232 +103,203 @@ scheduler:
   poll_interval: "6h"
 ```
 
-По умолчанию сервис ищет `config.yaml` в текущей рабочей директории. Другой
-путь можно задать флагом `--config /path/to/config.yaml` или переменной
-окружения `FIAS_CONFIG_PATH` — это единственная переменная окружения,
-которую понимает сервис; всё остальное читается только из YAML. Не
-указанные в файле поля берутся из значений по умолчанию (см.
-`internal/config/config.go`), обязательные поля (`postgres.dsn`, непустой
-`source.url`, `download.dir`, `http.listen_addr`, положительный
-`scheduler.poll_interval`) проверяются при старте — при их отсутствии
-сервис не запустится и явно сообщит, чего не хватает.
+Неуказанные поля получают значения по умолчанию. Обязательны непустые
+`postgres.dsn`, `source.url`, `download.dir`, `http.listen_addr` и положительный
+`scheduler.poll_interval`. Длительности задаются строками Go duration: `30s`,
+`10m`, `6h`.
 
-## Troubleshooting докачки
-
-Сервис скачивает архив через `wget --continue`. При наличии частичного файла
-сначала выполняется небольшой запрос с заголовком `Range`, затем `wget`
-пытается продолжить загрузку. Для диагностики проверяйте URL из сообщения
-`starting wget` в логах (команды можно выполнять внутри контейнера
-`fias-downloader`, где доступен тот же сетевой маршрут):
-
-```bash
-# Заголовки обычного запроса через wget, включая служебный вывод диагностики
-wget -S --spider 'https://example.invalid/path/archive.zip'
-
-# То же через curl; -I отправляет HEAD-запрос
-curl -I -L 'https://example.invalid/path/archive.zip'
-
-# Проверка именно докачки с произвольного смещения
-curl -v -L -H 'Range: bytes=1048576-' \
-  -o /dev/null 'https://example.invalid/path/archive.zip'
-```
-
-Вместо `example.invalid/...` подставьте фактический URL архива. Для проверки
-нужно смотреть не только на код ответа, но и на заголовки:
-
-| Ответ | Что означает | Действие |
-|---|---|---|
-| `206 Partial Content` и `Content-Range: bytes <offset>-...` | сервер поддерживает докачку с указанного смещения | можно продолжать загрузку |
-| `200 OK` на запрос с `Range` | сервер проигнорировал `Range` или промежуточный прокси его удалил | сервис удалит частичный файл и начнёт загрузку заново |
-| `416 Range Not Satisfiable` | смещение больше актуального размера объекта или файл на сервере изменился | удалить локальный частичный файл и проверить URL/версию архива |
-| `403` / `404` | ссылка недоступна, истекла или архив больше не существует | получить свежий URL через `GetAllDownloadFileInfo` и проверить доступ |
-| `5xx`, timeout, `wget: ... Connection reset` | временная проблема сервера или сети | проверить доступность, `stall_timeout` и логи повторных попыток |
-
-Пример ожидаемого ответа для поддерживаемой докачки:
-
-```text
-< HTTP/1.1 206 Partial Content
-< Content-Range: bytes 1048576-2097151/2097152
-< Content-Length: 1048576
-```
-
-Типовые сообщения и проверки:
-
-- `stalled: no data for 10m` — файл не рос дольше `download.stall_timeout`.
-  Проверьте задержки/обрывы в `wget -S`, доступность URL из контейнера и не
-  слишком ли мал `stall_timeout` для текущего канала. После обрыва сервис
-  повторит попытку с докачкой, пока не исчерпает `max_retries`.
-- `wget failed: ...` — полезная причина от `wget` добавляется в лог (до 2000
-  символов). Запустите тот же URL вручную с `wget -S` и проверьте DNS, TLS,
-  прокси, HTTP-код и наличие свободного места.
-- `source does not support resume ... restarting download from zero` — probe
-  получил `200` или `416`; это штатный фолбэк на полную загрузку. Если такое
-  происходит неожиданно, сравните результат `curl -v -H 'Range: bytes=...'`
-  и обычного запроса.
-- `download failed after ... attempts without progress` — исчерпаны попытки,
-  которые завершались без увеличения файла. Проверьте последние записи логов,
-  увеличьте `download.max_retries` только после устранения сетевой причины и
-  убедитесь, что каталог загрузки доступен для записи.
-
-Проверить состояние контейнера и последние сообщения можно так:
-
-```bash
-docker compose ps fias-downloader
-docker compose logs --tail=200 fias-downloader
-docker compose exec fias-downloader sh -c \
-  "wget -S --spider 'https://example.invalid/path/archive.zip'"
-```
-
-Если частичный файл заведомо устарел или удалён на стороне источника, его
-можно удалить из `download.dir`, после чего следующий цикл скачает архив с
-нуля. Не удаляйте файл во время активной загрузки: дождитесь завершения цикла
-или остановите сервис.
-
-## Запуск через Docker Compose (рекомендуется)
-
-```bash
-docker compose up --build
-```
-
-> Если вы уже запускали более раннюю версию `docker-compose.yml` с
-> именованным volume `downloads` — он больше не используется и его можно
-> удалить: `docker compose down -v && docker compose up --build`.
-
-Поднимает четыре сервиса:
-
-| Сервис | Порт на хосте | Назначение |
-|---|---|---|
-| `fias-downloader` | `8080` | сам микросервис (API + `/metrics`) |
-| `postgres` | `5432` | хранилище `version_info` и `logs` |
-| `prometheus` | `9090` | сбор метрик с `fias-downloader:8080/metrics` |
-| `grafana` | `3000` | дашборд по метрикам (источник данных и дашборд провижинятся автоматически) |
-
-Grafana доступна на [http://localhost:3000](http://localhost:3000), логин/пароль
-по умолчанию — `admin` / `admin` (задаются `GF_SECURITY_ADMIN_USER` /
-`GF_SECURITY_ADMIN_PASSWORD` в `docker-compose.yml`, поменяйте перед
-эксплуатацией вне локальной машины). Источник данных Prometheus и дашборд
-**FIAS Downloader** (загрузки по результату, скорость и длительность
-загрузки по типу файла, длительность циклов, последние успешно загруженные
-`full`/`delta`-версии и т.д.) подключаются автоматически при первом старте
-через `deploy/grafana/provisioning`; вручную ничего настраивать не нужно.
-
-Конфигурация сервиса берётся из `deploy/config.docker.yaml` — он
-монтируется в контейнер как `/app/config.yaml` (см. `docker-compose.yml`);
-поправьте его под себя перед запуском в проде (например, пароль в
-`postgres.dsn`).
-
-БД, метрики Prometheus и настройки/сессии Grafana сохраняются в именованных
-docker volume'ах (`pgdata`, `prometheus-data`, `grafana-data`) и переживают
-перезапуск контейнеров.
-Скачанные архивы справочника, напротив, сохраняются **не в volume, а в
-локальный каталог хоста** `./var/data/downloads` (bind mount на
-`/app/data/downloads` внутри контейнера) — так к файлам можно обратиться
-напрямую из другого ПО на хосте (например, из процесса импорта), не заходя
-внутрь контейнера. Каталог создаётся автоматически при первом запуске
-(`entrypoint.sh` вызывает `mkdir -p` и выставляет владельца перед стартом
-сервиса — см. ниже), в репозитории лежит как пустой с `.gitkeep`.
-
-### О правах на каталог с архивами
-
-Сервис внутри контейнера работает от непривилегированного пользователя
-`app` (uid 10001), а `./var/data/downloads` — это обычный каталог хоста, чей
-владелец докеру заранее не известен. Чтобы это не приводило к `permission
-denied`, контейнер стартует от `root`, `entrypoint.sh` выставляет
-`chown -R app:app /app/data`, и только после этого процесс сервиса
-запускается от `app` (через `su-exec`). Это стандартный паттерн для
-bind-mount'ов с неизвестным UID на хосте и применяется при каждом старте
-контейнера — вручную ничего chmod'ить не нужно.
-
-## Запуск без Docker (локально)
+Для локального запуска скопируйте пример:
 
 ```bash
 cp config.example.yaml config.yaml
-# отредактируйте config.yaml — как минимум postgres.dsn
+# отредактируйте как минимум postgres.dsn
 go run ./cmd/fias-downloader
 ```
 
-Таблицы `version_info` и `logs` создаются автоматически при старте
-(`EnsureSchema`); при желании применяйте `migrations/0001_init.sql` и
-`migrations/0002_logs.sql` отдельно через свой инструмент миграций вместо
-авто-создания.
+`config.yaml` содержит секреты и исключён из Git.
+
+## Сборка и Makefile
+
+```bash
+make help            # список целей
+make binary          # бинарник ./bin/fias-downloader
+make docker-images   # образ fias-downloader-fias-downloader
+make build           # бинарник и Docker-образ
+make test            # go test ./...
+make vet             # go vet ./...
+make fmt              # go fmt ./...
+```
+
+Docker-образ собирается с vendored-зависимостями и `CGO_ENABLED=0`. Во время
+работы контейнер использует непривилегированного пользователя `app` с uid 10001.
+
+## Docker Compose
+
+Compose ожидает локальный образ `fias-downloader-fias-downloader`, поэтому его
+нужно собрать до первого запуска:
+
+```bash
+make docker-images
+docker compose up -d
+```
+
+Либо:
+
+```bash
+make build
+make compose-up
+```
+
+Сервисы и адреса на хосте:
+
+| Сервис | Адрес | Назначение |
+|---|---|---|
+| `fias-downloader` | `http://localhost:8888` | HTTP API и `/metrics` |
+| `postgres` | `localhost:5431` | `version_info` и `logs` |
+| `prometheus` | `http://localhost:9999` | хранение и запрос метрик |
+| `grafana` | `http://localhost:3000` | dashboard текущей загрузки |
+
+Compose монтирует `deploy/config.docker.yaml` как `/app/config.yaml` и
+`./var/data/downloads` как `/app/data/downloads`. `entrypoint.sh` создаёт каталог,
+назначает его пользователю `app`, после чего запускает сервис через `su-exec`.
+Вручную менять права каталога не требуется.
+
+PostgreSQL, Prometheus и Grafana используют именованные volumes `pgdata`,
+`prometheus-data` и `grafana-data`. Архивы хранятся отдельно в bind mount
+`./var/data/downloads` и не удаляются командой `docker compose down -v`.
+
+Grafana использует автоматически provisioned Prometheus datasource и dashboard
+`FIAS Downloader — текущая загрузка`. Локальные учётные данные по умолчанию:
+`admin` / `admin`; перед внешней эксплуатацией их необходимо изменить.
+
+Полезные команды:
+
+```bash
+docker compose ps
+docker compose logs -f fias-downloader
+docker compose down
+```
+
+После пересборки образа с тем же тегом контейнер можно пересоздать так:
+
+```bash
+make docker-images
+docker compose up -d --force-recreate fias-downloader
+```
 
 ## HTTP API
 
-- `GET  /healthz` — liveness-проверка.
-- `GET  /metrics` — метрики в формате Prometheus.
-- `POST /trigger/sync` — внеплановый цикл (та же логика full/delta, что и по расписанию), асинхронно, ответ `202 Accepted`.
-- `POST /trigger/full` — принудительная загрузка последней полной версии, даже если полная версия уже загружена, асинхронно, ответ `202 Accepted`.
+| Метод и путь | Ответ | Назначение |
+|---|---|---|
+| `GET /healthz` | `200 ok` | liveness-проверка |
+| `GET /metrics` | `200` | метрики Prometheus |
+| `POST /trigger/sync` | `202 {"status":"started"}` | асинхронный обычный цикл full/delta |
+| `POST /trigger/full` | `202 {"status":"started"}` | асинхронная принудительная latest-full загрузка |
 
-## Метрики Prometheus
+Trigger-запрос возвращается сразу. Если другой цикл уже выполняется, новый цикл
+будет пропущен, а причина попадёт в лог.
 
-Все метрики в пространстве имён `fias_`:
+Примеры:
 
-| Метрика | Тип | Labels | Описание |
-|---|---|---|---|
-| `fias_source_fetch_total` | counter | `result` | запросы перечня версий к источнику |
-| `fias_source_fetch_duration_seconds` | histogram | — | длительность запроса перечня версий |
-| `fias_cycle_total` | counter | `result` | завершённые циклы проверки/загрузки |
-| `fias_cycle_duration_seconds` | histogram | — | длительность цикла |
-| `fias_download_total` | counter | `kind`, `result` | загрузки файлов версий |
-| `fias_download_bytes_total` | counter | `kind` | суммарно загруженных байт |
-| `fias_download_duration_seconds` | histogram | `kind` | длительность загрузки файла |
-| `fias_download_in_progress` | gauge | `kind` | загрузок выполняется прямо сейчас |
-| `fias_download_progress_downloaded_bytes` | gauge | `kind`, `version_id` | уже загружено байт для текущей загрузки |
-| `fias_download_progress_total_bytes` | gauge | `kind`, `version_id` | ожидаемый размер текущей загрузки |
-| `fias_last_completed_version_id` | gauge | `kind` | `VersionId` последней успешной загрузки |
-| `fias_last_cycle_timestamp_seconds` | gauge | — | unix-время завершения последнего цикла |
+```bash
+curl http://localhost:8888/healthz
+curl -X POST http://localhost:8888/trigger/sync
+curl -X POST http://localhost:8888/trigger/full
+```
 
-Плюс стандартные метрики рантайма Go (`go_*`) и процесса (`process_*`).
+## Метрики и Grafana
 
-## Логи в БД
+Экспортируются только метрики текущей загрузки:
 
-Логи пишутся одновременно:
+| Метрика | Labels | Описание |
+|---|---|---|
+| `fias_download_in_progress` | `kind` | количество активных загрузок |
+| `fias_download_progress_downloaded_bytes` | `kind`, `version_id` | получено байт |
+| `fias_download_progress_total_bytes` | `kind`, `version_id` | полный размер или `0`, если неизвестен |
 
-- в stdout — структурированный JSON (`docker compose logs -f fias-downloader`, удобно агрегировать во внешнюю систему при необходимости);
-- в таблицу `logs` в PostgreSQL — для быстрых запросов и корреляции с
-  `version_info` без похода во внешнюю систему логирования.
+Метрики с `version_id` создаются при старте загрузки и удаляются после успеха
+или ошибки. Стандартные collectors `go_*` и `process_*` не регистрируются.
+Dashboard показывает активность, процент, загруженный и полный объём, а также
+прогресс текущей загрузки во времени. Prometheus опрашивает сервис каждые 15
+секунд, dashboard обновляется каждые 5 секунд.
 
-Запись в БД асинхронная и батчевая (по умолчанию — раз в 2 секунды или по
-накоплении 200 записей), с ограниченной по размеру очередью в памяти: при
-переполнении новые записи логов отбрасываются, а не блокируют работу
-сервиса. Пример запроса последних ошибок:
+![Dashboard текущей загрузки FIAS Downloader](img/dashboard.jpg)
+
+## PostgreSQL и логи
+
+При старте сервис автоматически создаёт таблицы `version_info` и `logs`.
+SQL-версии схем также находятся в `migrations/0001_init.sql` и
+`migrations/0002_logs.sql`.
+
+`version_info` содержит отдельную строку для каждой пары `(version_id, kind)` и
+статусы `pending`, `downloading`, `completed`, `failed`. Для успешной загрузки
+сохраняются итоговый размер, путь и SHA-256; для неуспешной — текст последней
+ошибки. Частичный файл остаётся на диске для следующей попытки.
+
+Структурированные логи уровня INFO и выше одновременно пишутся:
+
+- в stdout как JSON;
+- асинхронно в таблицу `logs` пакетами до 200 записей или раз в 2 секунды.
+
+Очередь логов содержит до 2000 записей. При переполнении новые записи
+отбрасываются, чтобы медленная БД не блокировала загрузку. При штатном завершении
+очередь сбрасывается с таймаутом 5 секунд.
+
+Пример запроса:
 
 ```sql
-SELECT ts, message, attrs
+SELECT ts, level, message, attrs
 FROM logs
 WHERE level = 'ERROR'
 ORDER BY ts DESC
 LIMIT 50;
 ```
 
+## Диагностика загрузки
+
+Проверка поддержки resume:
+
+```bash
+curl -v -L -H 'Range: bytes=1048576-' \
+  -o /dev/null 'https://example.invalid/path/archive.zip'
+```
+
+| Ответ | Поведение сервиса |
+|---|---|
+| `206` с ожидаемым `Content-Range` | продолжает `.part` с текущего смещения |
+| `200` на Range-запрос | очищает `.part` и начинает заново |
+| `416`, полный размер равен размеру `.part` | завершает файл без повторной загрузки |
+| другой `416` | завершает попытку ошибкой и повторяет согласно retry policy |
+| другой HTTP-статус или сетевая ошибка | сохраняет ошибку и повторяет попытку |
+
+Если `.part` заведомо относится к другому содержимому, остановите сервис,
+удалите соответствующий файл из `download.dir` и запустите сервис снова. Не
+удаляйте файл во время активной записи.
+
+Типовые сообщения:
+
+- `stalled: no data for ...` — поток не передавал данные дольше stall timeout;
+- `source ignored Range request` — сервер не поддержал resume;
+- `download interrupted: received ...` — фактический размер не совпал с
+  ожидаемым;
+- `download failed after ... attempts without progress` — исчерпан retry budget
+  последовательных попыток без роста `.part`.
+
 ## Тесты
 
 ```bash
 go test ./...
+go vet ./...
 ```
 
-Для тестов и локального запуска нужен установленный `wget` в `PATH`
-(в Docker-образ он уже добавлен в `Dockerfile`).
+Тесты покрывают YAML-конфигурацию, resume через `206`, fallback при игнорировании
+Range, сброс retry budget после прогресса, консольный прогресс, состав метрик
+текущей загрузки и fan-out логов.
 
-Покрыты: ключевые сценарии докачки через `wget --continue` (резюме через
-`Range` после обрыва, фолбэк на полную перезагрузку при отсутствии
-поддержки `Range`), фан-аут
-логов на несколько обработчиков (`TeeHandler`) и загрузка/валидация YAML-конфигурации
-(значения по умолчанию, переопределение из файла, ошибки при отсутствующем
-`postgres.dsn`, некорректной длительности и отсутствующем файле).
+## Ограничения
 
-## Открытые вопросы (перенесены из ТЗ, не решены в коде)
-
-- Поведение после принудительной загрузки новой полной версии: код сохраняет
-  её как ещё одну запись `kind='full'`, но не удаляет и не помечает
-  неактуальными предыдущую полную версию и уже накопленные дельты — это
-  решение уровня бизнес-логики импорта, вне рамок данного сервиса.
-- Распределённая блокировка для запуска в нескольких экземплярах не
-  реализована (`sync.Mutex` в `Scheduler` защищает только от параллельного
-  запуска в рамках одного процесса).
-- Хранение файлов — локальная файловая система (при Docker-запуске — bind
-  mount `./var/data/downloads` на хосте); вынесение в объектное хранилище
-  не реализовано.
-- Ротация/очистка старых записей в таблице `logs` не реализована — при
-  долгой эксплуатации таблицу стоит периодически партиционировать или
-  чистить по возрасту.
+- Нет распределённой блокировки между несколькими экземплярами сервиса.
+- Архивы хранятся только в локальной файловой системе.
+- Автоматической очистки старых архивов и `.part` нет.
+- Для таблицы `logs` нет retention/rotation.
+- Принудительная full-загрузка не удаляет предыдущие full и delta.

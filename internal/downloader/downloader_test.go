@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,18 +16,9 @@ import (
 	"time"
 )
 
-func requireWget(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("wget"); err != nil {
-		t.Skip("wget not found in PATH")
-	}
-}
-
 // TestDownload_Resume проверяет, что при наличии частично загруженного файла
 // повторный вызов Download докачивает недостающий хвост.
 func TestDownload_Resume(t *testing.T) {
-	requireWget(t)
-
 	content := strings.Repeat("0123456789", 100_000) // 1,000,000 байт
 	want := sha256.Sum256([]byte(content))
 
@@ -60,7 +51,7 @@ func TestDownload_Resume(t *testing.T) {
 	dest := filepath.Join(dir, "file.bin")
 
 	// Имитируем ранее прерванную загрузку: на диске уже лежит первая часть файла.
-	if err := os.WriteFile(dest, []byte(content[:400_000]), 0o644); err != nil {
+	if err := os.WriteFile(dest+".part", []byte(content[:400_000]), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,8 +96,6 @@ func TestDownload_Resume(t *testing.T) {
 // TestDownload_ServerIgnoresRange проверяет фолбэк на перезагрузку,
 // когда сервер не поддерживает Range и всегда отвечает 200 с полным телом.
 func TestDownload_ServerIgnoresRange(t *testing.T) {
-	requireWget(t)
-
 	content := "hello world, no range support here"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -116,11 +105,12 @@ func TestDownload_ServerIgnoresRange(t *testing.T) {
 
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "file.bin")
-	if err := os.WriteFile(dest, []byte("STALE-PARTIAL-DATA"), 0o644); err != nil {
+	if err := os.WriteFile(dest+".part", []byte("STALE-PARTIAL-DATA"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	d := New(nil, Options{MaxRetries: 1, RetryBaseDelay: time.Millisecond, StallTimeout: 5 * time.Second, ProgressEvery: 20 * time.Millisecond})
+	var progress bytes.Buffer
+	d := New(nil, Options{MaxRetries: 1, RetryBaseDelay: time.Millisecond, StallTimeout: 5 * time.Second, ProgressEvery: 20 * time.Millisecond, ConsoleEvery: time.Nanosecond, ProgressOutput: &progress, ConsoleLines: true})
 	res, err := d.Download(context.Background(), srv.URL, dest, nil)
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
@@ -132,14 +122,18 @@ func TestDownload_ServerIgnoresRange(t *testing.T) {
 	if string(got) != content {
 		t.Fatalf("file was not overwritten correctly, got %q", string(got))
 	}
+	if output := progress.String(); !strings.Contains(output, "сервер не поддержал докачку") ||
+		!strings.Contains(output, "загрузка с позиции 0 B") ||
+		!strings.Contains(output, "100.0%") ||
+		!strings.Contains(output, "готово: "+dest) {
+		t.Fatalf("unexpected console progress output: %q", output)
+	}
 }
 
 // TestDownload_RetryBudgetResetsOnProgress проверяет, что лимит ретраев
 // применяется к подряд идущим ошибкам без прогресса. Если прогресс есть
 // (файл на диске растёт), бюджет ошибок должен сбрасываться.
 func TestDownload_RetryBudgetResetsOnProgress(t *testing.T) {
-	requireWget(t)
-
 	content := strings.Repeat("abcdefghij", 200) // 2000 байт
 
 	var rangeCalls int
@@ -179,7 +173,7 @@ func TestDownload_RetryBudgetResetsOnProgress(t *testing.T) {
 
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "file.bin")
-	if err := os.WriteFile(dest, []byte(content[:100]), 0o644); err != nil {
+	if err := os.WriteFile(dest+".part", []byte(content[:100]), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

@@ -17,7 +17,7 @@ services:
       retries: 10
 
   fias-downloader:
-    build: .
+    image: fias-downloader-fias-downloader
     restart: unless-stopped
     depends_on:
       postgres:

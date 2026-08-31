@@ -1,9 +1,7 @@
-// Package downloader выполняет загрузку файлов через wget с поддержкой
-// докачки (continue) и ретраями при временных ошибках.
+// Package downloader downloads files over HTTP with resume support and retries.
 package downloader
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,29 +13,30 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// ProgressFunc вызывается периодически в процессе загрузки с текущим
-// количеством загруженных байт и (если известно) общим размером файла.
-// totalBytes может быть 0, если общий размер пока неизвестен.
 type ProgressFunc func(downloadedBytes, totalBytes int64)
 
 type Options struct {
 	MaxRetries     int
 	RetryBaseDelay time.Duration
-	StallTimeout   time.Duration // максимальная пауза без роста файла
-	ProgressEvery  time.Duration // как часто отдавать прогресс
+	StallTimeout   time.Duration
+	ProgressEvery  time.Duration
+	ConsoleEvery   time.Duration
+	ProgressOutput io.Writer
+	ConsoleLines   bool
 	Logger         *slog.Logger
 }
 
 type Downloader struct {
-	probeClient *http.Client
-	opts        Options
-	log         *slog.Logger
+	client *http.Client
+	opts   Options
+	log    *slog.Logger
 }
 
 func New(client *http.Client, opts Options) *Downloader {
@@ -53,46 +52,39 @@ func New(client *http.Client, opts Options) *Downloader {
 	if opts.ProgressEvery <= 0 {
 		opts.ProgressEvery = 5 * time.Second
 	}
-
-	probeClient := &http.Client{Timeout: 30 * time.Second}
-	if client != nil {
-		clone := *client
-		if clone.Timeout <= 0 {
-			clone.Timeout = 30 * time.Second
-		}
-		probeClient = &clone
+	if opts.ConsoleEvery <= 0 {
+		opts.ConsoleEvery = 5 * time.Second
 	}
-
-	return &Downloader{probeClient: probeClient, opts: opts, log: opts.Logger}
+	if client == nil {
+		client = &http.Client{}
+	}
+	return &Downloader{client: client, opts: opts, log: opts.Logger}
 }
 
-// Result — итог успешной загрузки.
 type Result struct {
 	TotalBytes int64
 	SHA256     string
 }
 
-// Download скачивает url в destPath через wget --continue.
-// При временных ошибках выполняет повторные попытки с backoff.
+// Download stores incomplete data in destPath.part and atomically renames it
+// after the complete response has been received and synced.
 func (d *Downloader) Download(ctx context.Context, url, destPath string, onProgress ProgressFunc) (Result, error) {
+	partPath := destPath + ".part"
 	var lastErr error
-	consecutiveNoProgressFailures := 0
-
+	noProgressFailures := 0
 	for {
-		if consecutiveNoProgressFailures > d.opts.MaxRetries {
+		if noProgressFailures > d.opts.MaxRetries {
 			return Result{}, fmt.Errorf("download failed after %d attempts without progress: %w", d.opts.MaxRetries+1, lastErr)
 		}
-
-		if consecutiveNoProgressFailures > 0 {
-			delay := backoff(d.opts.RetryBaseDelay, consecutiveNoProgressFailures)
+		if noProgressFailures > 0 {
 			select {
 			case <-ctx.Done():
 				return Result{}, ctx.Err()
-			case <-time.After(delay):
+			case <-time.After(backoff(d.opts.RetryBaseDelay, noProgressFailures)):
 			}
 		}
 
-		beforeSize := fileSize(destPath)
+		beforeSize := fileSize(partPath)
 		res, err := d.attempt(ctx, url, destPath, onProgress)
 		if err == nil {
 			return res, nil
@@ -101,197 +93,288 @@ func (d *Downloader) Download(ctx context.Context, url, destPath string, onProgr
 			return Result{}, err
 		}
 		lastErr = err
-
-		afterSize := fileSize(destPath)
+		afterSize := fileSize(partPath)
 		if afterSize > beforeSize {
-			consecutiveNoProgressFailures = 0
+			noProgressFailures = 0
 			if d.log != nil {
 				d.log.Warn("download attempt failed after progress, retrying", "error", err, "bytes_before", beforeSize, "bytes_after", afterSize)
 			}
 			continue
 		}
-
-		consecutiveNoProgressFailures++
+		noProgressFailures++
 		if d.log != nil {
-			d.log.Warn("download attempt failed without progress", "error", err, "bytes", afterSize, "consecutive_no_progress_failures", consecutiveNoProgressFailures)
+			d.log.Warn("download attempt failed without progress", "error", err, "bytes", afterSize, "consecutive_no_progress_failures", noProgressFailures)
 		}
 	}
 }
 
 func (d *Downloader) attempt(ctx context.Context, url, destPath string, onProgress ProgressFunc) (Result, error) {
-	if err := os.MkdirAll(dirOf(destPath), 0o755); err != nil {
-		return Result{}, fmt.Errorf("mkdir: %w", err)
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return Result{}, fmt.Errorf("create download directory: %w", err)
 	}
+	partPath := destPath + ".part"
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return Result{}, fmt.Errorf("open partial file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Result{}, fmt.Errorf("stat partial file: %w", err)
+	}
+	offset := info.Size()
 
-	offset := fileSize(destPath)
-	var totalBytes int64
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return Result{}, fmt.Errorf("create download request: %w", err)
+	}
+	req.Header.Set("Accept-Encoding", "identity")
 	if offset > 0 {
-		canResume, remoteTotal, probeErr := d.canResume(ctx, url, offset)
-		totalBytes = remoteTotal
-		if probeErr != nil {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+	if d.log != nil {
+		d.log.Info("starting HTTP download", "url", url, "dest", destPath, "offset", offset)
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return Result{}, fmt.Errorf("execute download request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	expectedTotal := int64(0)
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		start, total, parseErr := parseContentRange(resp.Header.Get("Content-Range"))
+		if parseErr != nil || start != offset {
+			return Result{}, fmt.Errorf("invalid Content-Range %q for offset %d", resp.Header.Get("Content-Range"), offset)
+		}
+		expectedTotal = total
+	case http.StatusOK:
+		if offset > 0 {
 			if d.log != nil {
-				d.log.Warn("resume probe failed, proceeding with wget --continue", "error", probeErr, "url", url, "offset", offset)
+				d.log.Warn("source ignored Range request, restarting download from zero", "url", url, "offset", offset)
 			}
-		} else if !canResume {
-			if d.log != nil {
-				d.log.Warn("source does not support resume for current partial file, restarting download from zero", "url", url, "offset", offset)
-			}
-			if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
-				return Result{}, fmt.Errorf("remove stale partial file: %w", err)
+			if d.opts.ProgressOutput != nil {
+				fmt.Fprintln(d.opts.ProgressOutput, "сервер не поддержал докачку; начинаю заново")
 			}
 		}
-	}
-	if totalBytes <= 0 {
-		totalBytes = d.probeTotal(ctx, url)
-	}
-
-	readTimeoutSec := int64(d.opts.StallTimeout.Seconds())
-	if readTimeoutSec <= 0 {
-		readTimeoutSec = 1
-	}
-
-	args := []string{
-		"--continue",
-		"--output-document=" + destPath,
-		"--tries=1",
-		"--retry-connrefused",
-		"--read-timeout=" + fmt.Sprintf("%d", readTimeoutSec),
-		"--timeout=" + fmt.Sprintf("%d", readTimeoutSec),
-		"--no-verbose",
-		url,
+		offset = 0
+		if err := f.Truncate(0); err != nil {
+			return Result{}, fmt.Errorf("truncate partial file: %w", err)
+		}
+		expectedTotal = resp.ContentLength
+		if expectedTotal < 0 {
+			expectedTotal = 0
+		}
+	case http.StatusRequestedRangeNotSatisfiable:
+		total, ok := rangeTotal(resp.Header.Get("Content-Range"))
+		if ok && total == offset {
+			return finishDownload(f, partPath, destPath, total, onProgress, d.opts.ProgressOutput)
+		}
+		return Result{}, fmt.Errorf("server rejected download range: %s", resp.Status)
+	default:
+		return Result{}, fmt.Errorf("server returned %s", resp.Status)
 	}
 
-	var output bytes.Buffer
-	cmd := exec.CommandContext(ctx, "wget", args...)
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-
-	if d.log != nil {
-		d.log.Info("starting wget", "url", url, "dest", destPath, "args", args)
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return Result{}, fmt.Errorf("seek partial file: %w", err)
 	}
-
-	errCh := make(chan error, 1)
 	if onProgress != nil {
-		onProgress(fileSize(destPath), totalBytes)
+		onProgress(offset, expectedTotal)
 	}
+	if d.opts.ProgressOutput != nil {
+		fmt.Fprintf(d.opts.ProgressOutput, "загрузка с позиции %s", formatBytes(offset))
+		if expectedTotal > 0 {
+			fmt.Fprintf(d.opts.ProgressOutput, " из %s", formatBytes(expectedTotal))
+		}
+		fmt.Fprintln(d.opts.ProgressOutput)
+	}
+	w := &progressWriter{
+		dst:           f,
+		output:        d.opts.ProgressOutput,
+		downloaded:    offset,
+		total:         expectedTotal,
+		callbackEvery: d.opts.ProgressEvery,
+		outputEvery:   d.opts.ConsoleEvery,
+		outputLines:   d.opts.ConsoleLines,
+		onProgress:    onProgress,
+		lastCallback:  time.Now(),
+		lastOutput:    time.Now(),
+		activity:      make(chan struct{}, 1),
+	}
+	copyErr := make(chan error, 1)
 	go func() {
-		errCh <- cmd.Run()
+		_, copyError := io.Copy(w, resp.Body)
+		copyErr <- copyError
 	}()
 
-	ticker := time.NewTicker(d.opts.ProgressEvery)
-	defer ticker.Stop()
-
-	lastSize := fileSize(destPath)
-	lastGrowthAt := time.Now()
-
+	stallTimer := time.NewTimer(d.opts.StallTimeout)
+	defer stallTimer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-			<-errCh
+			cancel()
+			<-copyErr
 			return Result{}, ctx.Err()
-		case err := <-errCh:
+		case err := <-copyErr:
 			if err != nil {
-				out := strings.TrimSpace(output.String())
-				if len(out) > 2000 {
-					out = out[:2000] + "..."
+				return Result{}, fmt.Errorf("download data: %w", err)
+			}
+			downloaded := w.Downloaded()
+			if expectedTotal > 0 && downloaded != expectedTotal {
+				return Result{}, fmt.Errorf("download interrupted: received %d of %d bytes", downloaded, expectedTotal)
+			}
+			return finishDownload(f, partPath, destPath, downloaded, onProgress, d.opts.ProgressOutput)
+		case <-w.activity:
+			if !stallTimer.Stop() {
+				select {
+				case <-stallTimer.C:
+				default:
 				}
-				if out != "" {
-					return Result{}, fmt.Errorf("wget failed: %w: %s", err, out)
-				}
-				return Result{}, fmt.Errorf("wget failed: %w", err)
 			}
-
-			total, sha, sumErr := fileSHA256(destPath)
-			if sumErr != nil {
-				return Result{}, fmt.Errorf("checksum file: %w", sumErr)
-			}
-			if onProgress != nil {
-				onProgress(total, total)
-			}
-			return Result{TotalBytes: total, SHA256: sha}, nil
-		case <-ticker.C:
-			sz := fileSize(destPath)
-			if sz > lastSize {
-				lastSize = sz
-				lastGrowthAt = time.Now()
-			}
-			if onProgress != nil {
-				onProgress(sz, totalBytes)
-			}
-			if time.Since(lastGrowthAt) >= d.opts.StallTimeout {
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
-				<-errCh
-				return Result{}, fmt.Errorf("stalled: no data for %s", d.opts.StallTimeout)
-			}
+			stallTimer.Reset(d.opts.StallTimeout)
+		case <-stallTimer.C:
+			cancel()
+			<-copyErr
+			return Result{}, fmt.Errorf("stalled: no data for %s", d.opts.StallTimeout)
 		}
 	}
 }
 
-func (d *Downloader) canResume(ctx context.Context, url string, offset int64) (bool, int64, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, d.probeClient.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return false, 0, fmt.Errorf("build resume probe request: %w", err)
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-
-	resp, err := d.probeClient.Do(req)
-	if err != nil {
-		return false, 0, fmt.Errorf("execute resume probe request: %w", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.CopyN(io.Discard, resp.Body, 1)
-
-	total := totalFromResponse(resp)
-	switch resp.StatusCode {
-	case http.StatusPartialContent:
-		return true, total, nil
-	case http.StatusOK, http.StatusRequestedRangeNotSatisfiable:
-		return false, total, nil
-	default:
-		return false, total, fmt.Errorf("unexpected resume probe status: %d", resp.StatusCode)
-	}
+type progressWriter struct {
+	dst           io.Writer
+	output        io.Writer
+	outputLines   bool
+	downloaded    int64
+	total         int64
+	callbackEvery time.Duration
+	outputEvery   time.Duration
+	onProgress    ProgressFunc
+	lastCallback  time.Time
+	lastOutput    time.Time
+	activity      chan struct{}
+	mu            sync.Mutex
 }
 
-// probeTotal получает полный размер объекта однобайтовым Range-запросом.
-func (d *Downloader) probeTotal(ctx context.Context, url string) int64 {
-	probeCtx, cancel := context.WithTimeout(ctx, d.probeClient.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0
+func (w *progressWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	w.mu.Lock()
+	w.downloaded += int64(n)
+	downloaded := w.downloaded
+	now := time.Now()
+	reportCallback := w.onProgress != nil && now.Sub(w.lastCallback) >= w.callbackEvery
+	reportOutput := w.output != nil && now.Sub(w.lastOutput) >= w.outputEvery
+	if reportCallback {
+		w.lastCallback = now
 	}
-	req.Header.Set("Range", "bytes=0-0")
-	resp, err := d.probeClient.Do(req)
-	if err != nil {
-		return 0
+	if reportOutput {
+		w.lastOutput = now
 	}
-	defer resp.Body.Close()
-	_, _ = io.CopyN(io.Discard, resp.Body, 1)
-	return totalFromResponse(resp)
-}
-
-func totalFromResponse(resp *http.Response) int64 {
-	if contentRange := resp.Header.Get("Content-Range"); contentRange != "" {
-		if slash := strings.LastIndexByte(contentRange, '/'); slash >= 0 {
-			total, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
-			if err == nil && total >= 0 {
-				return total
-			}
+	w.mu.Unlock()
+	if n > 0 {
+		select {
+		case w.activity <- struct{}{}:
+		default:
 		}
 	}
-	if resp.ContentLength >= 0 {
-		return resp.ContentLength
+	if reportCallback {
+		w.onProgress(downloaded, w.total)
 	}
-	return 0
+	if reportOutput {
+		writeConsoleProgress(w.output, downloaded, w.total, w.outputLines)
+	}
+	return n, err
+}
+
+func (w *progressWriter) Downloaded() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.downloaded
+}
+
+func finishDownload(f *os.File, partPath, destPath string, total int64, onProgress ProgressFunc, output io.Writer) (Result, error) {
+	if err := f.Sync(); err != nil {
+		return Result{}, fmt.Errorf("sync downloaded file: %w", err)
+	}
+	_, sha, err := fileSHA256(partPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("checksum downloaded file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return Result{}, fmt.Errorf("close downloaded file: %w", err)
+	}
+	if err := os.Rename(partPath, destPath); err != nil {
+		return Result{}, fmt.Errorf("rename downloaded file: %w", err)
+	}
+	if onProgress != nil {
+		onProgress(total, total)
+	}
+	if output != nil {
+		fmt.Fprintf(output, "\rзагружено %s\n", formatBytes(total))
+		fmt.Fprintln(output, "готово:", destPath)
+	}
+	return Result{TotalBytes: total, SHA256: sha}, nil
+}
+
+func writeConsoleProgress(output io.Writer, downloaded, total int64, lines bool) {
+	if output == nil {
+		return
+	}
+	prefix, suffix := "\r", ""
+	if lines {
+		prefix, suffix = "", "\n"
+	}
+	if total > 0 {
+		fmt.Fprintf(output, "%sзагружено %s / %s (%.1f%%)%s", prefix, formatBytes(downloaded), formatBytes(total), 100*float64(downloaded)/float64(total), suffix)
+		return
+	}
+	fmt.Fprintf(output, "%sзагружено %s%s", prefix, formatBytes(downloaded), suffix)
+}
+
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for q := n / unit; q >= unit && exp < 5; q /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func parseContentRange(value string) (start, total int64, err error) {
+	if !strings.HasPrefix(value, "bytes ") {
+		return 0, 0, errors.New("missing bytes prefix")
+	}
+	parts := strings.Split(strings.TrimPrefix(value, "bytes "), "/")
+	if len(parts) != 2 {
+		return 0, 0, errors.New("invalid content range")
+	}
+	bounds := strings.Split(parts[0], "-")
+	if len(bounds) != 2 {
+		return 0, 0, errors.New("invalid content range bounds")
+	}
+	start, err = strconv.ParseInt(bounds[0], 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	total, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || total < 0 {
+		return 0, 0, errors.New("invalid content range total")
+	}
+	return start, total, nil
+}
+
+func rangeTotal(value string) (int64, bool) {
+	if !strings.HasPrefix(value, "bytes */") {
+		return 0, false
+	}
+	total, err := strconv.ParseInt(strings.TrimPrefix(value, "bytes */"), 10, 64)
+	return total, err == nil && total >= 0
 }
 
 func fileSHA256(path string) (int64, string, error) {
@@ -300,7 +383,6 @@ func fileSHA256(path string) (int64, string, error) {
 		return 0, "", err
 	}
 	defer f.Close()
-
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
@@ -309,27 +391,17 @@ func fileSHA256(path string) (int64, string, error) {
 	return n, hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func dirOf(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			return path[:i]
-		}
-	}
-	return "."
-}
-
 func fileSize(path string) int64 {
-	fi, err := os.Stat(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		return 0
 	}
-	return fi.Size()
+	return info.Size()
 }
 
 func backoff(base time.Duration, attempt int) time.Duration {
-	d := time.Duration(float64(base) * math.Pow(2, float64(attempt-1)))
-	jitter := time.Duration(rand.Int63n(int64(base)))
-	return d + jitter
+	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt-1)))
+	return delay + time.Duration(rand.Int63n(int64(base)))
 }
 
 func isRetryable(err error) bool {

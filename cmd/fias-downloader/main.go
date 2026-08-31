@@ -90,12 +90,16 @@ func run(bootLogger *slog.Logger) error {
 	mt := metrics.New(reg)
 
 	f := fetcher.New(cfg.Source.URL, cfg.Source.HTTPTimeout.Duration)
+	stdoutInfo, stdoutErr := os.Stdout.Stat()
+	consoleProgressLines := stdoutErr != nil || stdoutInfo.Mode()&os.ModeCharDevice == 0
 
 	dl := downloader.New(&http.Client{Timeout: 0}, downloader.Options{
 		MaxRetries:     cfg.Download.MaxRetries,
 		RetryBaseDelay: cfg.Download.RetryBaseDelay.Duration,
 		StallTimeout:   cfg.Download.StallTimeout.Duration,
 		ProgressEvery:  cfg.Download.ProgressSaveInterval.Duration,
+		ProgressOutput: os.Stdout,
+		ConsoleLines:   consoleProgressLines,
 		Logger:         logger,
 	})
 	// Таймаут на весь запрос намеренно не задаётся (Timeout: 0) — загрузка

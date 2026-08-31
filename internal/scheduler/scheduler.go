@@ -46,9 +46,6 @@ func (s *Scheduler) RunCycle(ctx context.Context) (err error) {
 	}
 	defer s.runMu.Unlock()
 
-	start := time.Now()
-	defer func() { s.metrics.ObserveCycle(time.Since(start), err) }()
-
 	versions, err := s.fetchVersions(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch version list: %w", err)
@@ -109,9 +106,6 @@ func (s *Scheduler) ForceDownloadLatestFull(ctx context.Context) (err error) {
 	}
 	defer s.runMu.Unlock()
 
-	start := time.Now()
-	defer func() { s.metrics.ObserveCycle(time.Since(start), err) }()
-
 	versions, err := s.fetchVersions(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch version list: %w", err)
@@ -128,10 +122,7 @@ func (s *Scheduler) ForceDownloadLatestFull(ctx context.Context) (err error) {
 }
 
 func (s *Scheduler) fetchVersions(ctx context.Context) ([]model.SourceVersion, error) {
-	start := time.Now()
-	versions, err := s.fetcher.Fetch(ctx)
-	s.metrics.ObserveFetch(time.Since(start), err)
-	return versions, err
+	return s.fetcher.Fetch(ctx)
 }
 
 func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kind model.Kind, isManual bool) error {
@@ -158,6 +149,7 @@ func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kin
 	log.Info("starting download")
 
 	onProgress := func(downloaded, total int64) {
+		s.metrics.SetDownloadProgress(string(kind), sv.VersionID, downloaded, total)
 		progressCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
 		if err := s.repo.UpdateProgress(progressCtx, rec.ID, downloaded, total); err != nil {
@@ -172,10 +164,7 @@ func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kin
 	// медленном или временно зависшем соединении.
 	s.metrics.SetDownloadProgress(string(kind), sv.VersionID, 0, 0)
 	defer s.metrics.ClearDownloadProgress(string(kind), sv.VersionID)
-	dlStart := time.Now()
-
 	result, dlErr := s.downloader.Download(ctx, url, destPath, onProgress)
-	s.metrics.ObserveDownload(string(kind), time.Since(dlStart), result.TotalBytes, dlErr)
 	if dlErr != nil {
 		log.Error("download failed", "error", dlErr)
 		if markErr := s.repo.MarkFailed(ctx, rec.ID, dlErr); markErr != nil {
@@ -187,7 +176,6 @@ func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kin
 	if err := s.repo.MarkCompleted(ctx, rec.ID, result.TotalBytes, result.SHA256); err != nil {
 		return fmt.Errorf("mark completed: %w", err)
 	}
-	s.metrics.SetLastCompletedVersion(string(kind), sv.VersionID)
 	log.Info("download completed", "bytes", result.TotalBytes, "sha256", result.SHA256)
 	return nil
 }

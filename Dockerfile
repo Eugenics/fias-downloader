@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -mod=vendor -o /out/fias-downloader ./cmd/fias-downloader
 
 FROM alpine:3.20
-RUN apk add --no-cache su-exec wget
+RUN apk add --no-cache su-exec
 RUN adduser -D -u 10001 app
 WORKDIR /app
 COPY --from=build /out/fias-downloader /app/fias-downloader
