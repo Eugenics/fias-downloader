@@ -15,7 +15,7 @@ help:
 	@echo "  make build           - build binary and Docker images"
 	@echo "  make binary          - build binary to ./bin/$(APP)"
 	@echo "  make docker-images   - build Docker images"
-	@echo "  make compose-up      - docker compose up --build"
+	@echo "  make compose-up      - docker compose up"
 	@echo "  make compose-down    - docker compose down"
 	@echo "  make compose-rebuild - docker compose down -v && up --build"
 
@@ -41,7 +41,7 @@ docker-images:
 	docker build --tag $(DOCKER_IMAGE) .
 
 compose-up:
-	docker compose up --build
+	docker compose up -d
 
 compose-down:
 	docker compose down
