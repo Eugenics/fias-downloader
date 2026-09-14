@@ -19,12 +19,13 @@ import (
 )
 
 type Scheduler struct {
-	log         *slog.Logger
-	fetcher     *fetcher.Fetcher
-	repo        *repo.Repo
-	downloader  *downloader.Downloader
-	metrics     *metrics.Metrics
-	downloadDir string
+	log                  *slog.Logger
+	fetcher              *fetcher.Fetcher
+	repo                 *repo.Repo
+	downloader           *downloader.Downloader
+	metrics              *metrics.Metrics
+	downloadDir          string
+	progressSaveInterval time.Duration
 
 	// runMu гарантирует, что одновременно выполняется не более одного цикла
 	// загрузки в рамках этого процесса (защита от параллельного запуска
@@ -34,8 +35,8 @@ type Scheduler struct {
 	runMu sync.Mutex
 }
 
-func New(log *slog.Logger, f *fetcher.Fetcher, r *repo.Repo, d *downloader.Downloader, mt *metrics.Metrics, downloadDir string) *Scheduler {
-	return &Scheduler{log: log, fetcher: f, repo: r, downloader: d, metrics: mt, downloadDir: downloadDir}
+func New(log *slog.Logger, f *fetcher.Fetcher, r *repo.Repo, d *downloader.Downloader, mt *metrics.Metrics, downloadDir string, progressSaveInterval time.Duration) *Scheduler {
+	return &Scheduler{log: log, fetcher: f, repo: r, downloader: d, metrics: mt, downloadDir: downloadDir, progressSaveInterval: progressSaveInterval}
 }
 
 // RunCycle выполняет один цикл: получает перечень версий и догружает всё,
@@ -148,8 +149,12 @@ func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kin
 	log := s.log.With("version_id", sv.VersionID, "kind", kind, "url", url, "dest", destPath)
 	log.Info("starting download")
 
+	persistence := newProgressPersistence(s.progressSaveInterval, time.Now)
 	onProgress := func(downloaded, total int64) {
 		s.metrics.SetDownloadProgress(string(kind), sv.VersionID, downloaded, total)
+		if !persistence.shouldPersist(downloaded, total) {
+			return
+		}
 		progressCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
 		if err := s.repo.UpdateProgress(progressCtx, rec.ID, downloaded, total); err != nil {
@@ -172,10 +177,30 @@ func (s *Scheduler) downloadOne(ctx context.Context, sv model.SourceVersion, kin
 		}
 		return dlErr
 	}
-
 	if err := s.repo.MarkCompleted(ctx, rec.ID, result.TotalBytes, result.SHA256); err != nil {
 		return fmt.Errorf("mark completed: %w", err)
 	}
+	s.metrics.RecordCompletedDownload(string(kind), sv.VersionID, result.TotalBytes)
 	log.Info("download completed", "bytes", result.TotalBytes, "sha256", result.SHA256)
 	return nil
+}
+
+type progressPersistence struct {
+	interval time.Duration
+	now      func() time.Time
+	last     time.Time
+}
+
+func newProgressPersistence(interval time.Duration, now func() time.Time) *progressPersistence {
+	return &progressPersistence{interval: interval, now: now}
+}
+
+func (p *progressPersistence) shouldPersist(downloaded, total int64) bool {
+	now := p.now()
+	final := total > 0 && downloaded >= total
+	if !p.last.IsZero() && !final && now.Sub(p.last) < p.interval {
+		return false
+	}
+	p.last = now
+	return true
 }

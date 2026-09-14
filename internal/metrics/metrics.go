@@ -11,9 +11,10 @@ type Metrics struct {
 	downloadsInProgress             *prometheus.GaugeVec
 	downloadProgressDownloadedBytes *prometheus.GaugeVec
 	downloadProgressTotalBytes      *prometheus.GaugeVec
+	downloadCompletedBytes          *prometheus.GaugeVec
 }
 
-// New registers only metrics describing the current download.
+// New registers metrics describing current and completed downloads.
 func New(reg *prometheus.Registry) *Metrics {
 	m := &Metrics{
 		downloadsInProgress: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -28,14 +29,24 @@ func New(reg *prometheus.Registry) *Metrics {
 			Namespace: "fias", Subsystem: "download", Name: "progress_total_bytes",
 			Help: "Ожидаемый размер текущего файла; 0, если размер неизвестен.",
 		}, []string{"kind", "version_id"}),
+		downloadCompletedBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "fias", Subsystem: "download", Name: "completed_bytes",
+			Help: "Итоговый размер успешно завершённой загрузки.",
+		}, []string{"kind", "version_id"}),
 	}
 
 	reg.MustRegister(
 		m.downloadsInProgress,
 		m.downloadProgressDownloadedBytes,
 		m.downloadProgressTotalBytes,
+		m.downloadCompletedBytes,
 	)
 	return m
+}
+
+// RecordCompletedDownload keeps the final size for the lifetime of the process.
+func (m *Metrics) RecordCompletedDownload(kind string, versionID, total int64) {
+	m.downloadCompletedBytes.WithLabelValues(kind, strconv.FormatInt(versionID, 10)).Set(float64(total))
 }
 
 // DownloadStarted marks a download as active and returns its cleanup function.

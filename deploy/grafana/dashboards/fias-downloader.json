@@ -2,7 +2,7 @@
   "title": "FIAS Downloader — текущая загрузка",
   "uid": "fias-downloader",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": true,
   "timezone": "browser",
   "refresh": "5s",
@@ -105,6 +105,24 @@
           "expr": "fias_download_progress_total_bytes",
           "legendFormat": "всего: {{kind}} v{{version_id}}",
           "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "decbytes" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "Завершённые файлы",
+      "type": "table",
+      "description": "Итоговые размеры всех успешно завершённых загрузок с момента запуска сервиса.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "fias_download_completed_bytes",
+          "legendFormat": "{{kind}} v{{version_id}}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
         }
       ],
       "fieldConfig": { "defaults": { "unit": "decbytes" }, "overrides": [] }

@@ -15,6 +15,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - fias-downloader-network
 
   fias-downloader:
     image: fias-downloader-fias-downloader
@@ -27,8 +29,10 @@ services:
       - ./var/data/downloads:/app/data/downloads
     ports:
       - "8888:8080"
+    networks:
+      - fias-downloader-network
 
-  prometheus:
+  fias-downloader-prometheus:
     image: prom/prometheus:v2.53.0
     restart: unless-stopped
     depends_on:
@@ -42,24 +46,32 @@ services:
       - prometheus-data:/prometheus
     ports:
       - "9999:9090"
-  grafana:
-    image: grafana/grafana:11.1.0
-    restart: unless-stopped
-    depends_on:
-      - prometheus
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      # Отключает анонимный сбор аналитики использования Grafana.
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-    volumes:
-      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - grafana-data:/var/lib/grafana
-    ports:
-      - "3000:3000"
+    networks:
+      - fias-downloader-network
+  # fias-downloader-grafana:
+  #   image: grafana/grafana:11.1.0
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - fias-downloader-prometheus
+  #   environment:
+  #     GF_SECURITY_ADMIN_USER: admin
+  #     GF_SECURITY_ADMIN_PASSWORD: admin
+  #     # Отключает анонимный сбор аналитики использования Grafana.
+  #     GF_ANALYTICS_REPORTING_ENABLED: "false"
+  #   volumes:
+  #     - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+  #     - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+  #     - grafana-data:/var/lib/grafana
+  #   ports:
+  #     - "3001:3000"
+  #   networks:
+  #     - fias-downloader-network
 
 volumes:
   pgdata:
   prometheus-data:
   grafana-data:
+
+networks:
+  fias-downloader-network:
+    name: fias-downloader-network

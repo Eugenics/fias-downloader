@@ -97,7 +97,7 @@ func run(bootLogger *slog.Logger) error {
 		MaxRetries:     cfg.Download.MaxRetries,
 		RetryBaseDelay: cfg.Download.RetryBaseDelay.Duration,
 		StallTimeout:   cfg.Download.StallTimeout.Duration,
-		ProgressEvery:  cfg.Download.ProgressSaveInterval.Duration,
+		ProgressEvery:  time.Second,
 		ProgressOutput: os.Stdout,
 		ConsoleLines:   consoleProgressLines,
 		Logger:         logger,
@@ -107,7 +107,7 @@ func run(bootLogger *slog.Logger) error {
 	// защита от "зависания" по неактивности (StallTimeout) и общий
 	// контекст сервиса, отменяемый по сигналу остановки.
 
-	sch := scheduler.New(logger, f, db, dl, mt, cfg.Download.Dir)
+	sch := scheduler.New(logger, f, db, dl, mt, cfg.Download.Dir, cfg.Download.ProgressSaveInterval.Duration)
 
 	srv := &http.Server{
 		Addr:    cfg.HTTP.ListenAddr,
