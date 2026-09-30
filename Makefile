@@ -3,8 +3,9 @@ SHELL := /bin/bash
 APP := fias-downloader
 CMD := ./cmd/fias-downloader
 DOCKER_IMAGE := fias-downloader-fias-downloader
+API_URL ?= http://localhost:8888
 
-.PHONY: help run test fmt vet build binary docker-images compose-up compose-down compose-rebuild
+.PHONY: help run test fmt vet build binary docker-images compose-up compose-down compose-rebuild download download-full status
 
 help:
 	@echo "Available targets:"
@@ -18,6 +19,9 @@ help:
 	@echo "  make compose-up      - docker compose up"
 	@echo "  make compose-down    - docker compose down"
 	@echo "  make compose-rebuild - docker compose down -v && up --build"
+	@echo "  make download        - start a manual full/delta sync"
+	@echo "  make download-full   - start a forced latest-full download"
+	@echo "  make status          - show current downloads"
 
 run:
 	go run $(CMD)
@@ -49,3 +53,12 @@ compose-down:
 compose-rebuild:
 	docker compose down -v
 	docker compose up --build
+
+download:
+	@curl --fail --show-error --silent --output /dev/null --request POST "$(API_URL)/trigger/sync" && echo "Запущена проверка и загрузка full/delta. Результат смотрите в логах сервиса."
+
+download-full:
+	@curl --fail --show-error --silent --output /dev/null --request POST "$(API_URL)/trigger/full" && echo "Запущена принудительная загрузка последней full-версии. Результат смотрите в логах сервиса."
+
+status:
+	@metrics=$$(curl --fail --show-error --silent "$(API_URL)/metrics") || exit; printf '%s\n' "$$metrics" | awk -f scripts/download-status.awk
