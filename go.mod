@@ -5,6 +5,7 @@ go 1.22.2
 require (
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.19.1
+	github.com/rabbitmq/amqp091-go v1.10.0
 	gopkg.in/yaml.v3 v3.0.0-00010101000000-000000000000
 )
 

@@ -20,6 +20,7 @@ import (
 	"fias-downloader/internal/api"
 	"fias-downloader/internal/config"
 	"fias-downloader/internal/downloader"
+	"fias-downloader/internal/events"
 	"fias-downloader/internal/fetcher"
 	"fias-downloader/internal/logstore"
 	"fias-downloader/internal/metrics"
@@ -108,6 +109,9 @@ func run(bootLogger *slog.Logger) error {
 	// контекст сервиса, отменяемый по сигналу остановки.
 
 	sch := scheduler.New(logger, f, db, dl, mt, cfg.Download.Dir, cfg.Download.ProgressSaveInterval.Duration)
+	if cfg.RabbitMQ.URL != "" {
+		go events.Run(ctx, logger, db, cfg.RabbitMQ.URL, cfg.RabbitMQ.Queue)
+	}
 
 	srv := &http.Server{
 		Addr:    cfg.HTTP.ListenAddr,

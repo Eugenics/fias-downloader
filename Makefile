@@ -5,7 +5,7 @@ CMD := ./cmd/fias-downloader
 DOCKER_IMAGE := fias-downloader-fias-downloader
 API_URL ?= http://localhost:8888
 
-.PHONY: help run test fmt vet build binary docker-images compose-up compose-down compose-rebuild download download-full status
+.PHONY: help run test fmt vet build binary docker-images compose-up compose-down compose-rebuild migrate download download-full status
 
 help:
 	@echo "Available targets:"
@@ -19,6 +19,7 @@ help:
 	@echo "  make compose-up      - docker compose up"
 	@echo "  make compose-down    - docker compose down"
 	@echo "  make compose-rebuild - docker compose down -v && up --build"
+	@echo "  make migrate         - apply SQL migrations to Compose PostgreSQL"
 	@echo "  make download        - start a manual full/delta sync"
 	@echo "  make download-full   - start a forced latest-full download"
 	@echo "  make status          - show current downloads"
@@ -53,6 +54,9 @@ compose-down:
 compose-rebuild:
 	docker compose down -v
 	docker compose up --build
+
+migrate:
+	@set -o pipefail; cat migrations/[0-9]*.sql | docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -1 -U fias -d fias
 
 download:
 	@curl --fail --show-error --silent --output /dev/null --request POST "$(API_URL)/trigger/sync" && echo "Запущена проверка и загрузка full/delta. Результат смотрите в логах сервиса."

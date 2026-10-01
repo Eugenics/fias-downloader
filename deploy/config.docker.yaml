@@ -4,6 +4,10 @@
 postgres:
   dsn: "postgres://fias:fias@postgres:5432/fias?sslmode=disable"
 
+rabbitmq:
+  url: "amqp://fias:fias@rabbitmq:5672/"
+  queue: "fias.download.completed"
+
 source:
   url: "https://fias.nalog.ru/WebServices/Public/GetAllDownloadFileInfo"
   http_timeout: "30s"

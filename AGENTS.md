@@ -30,7 +30,7 @@ This repository contains a Go microservice that downloads FIAS/GAR address-refer
 - `docker compose up --build` — build and run the full stack.
 - `docker compose down -v && docker compose up --build` — discard old Compose volumes and recreate the stack when migrating from the earlier downloads volume layout.
 
-The Docker build uses vendored dependencies and runs `CGO_ENABLED=0 go build -mod=vendor -o /out/fias-downloader ./cmd/fias-downloader` inside the builder image. No Makefile or repository CI workflow is present.
+The Docker build downloads Go modules and runs `CGO_ENABLED=0 go build -mod=mod -o /out/fias-downloader ./cmd/fias-downloader` inside the builder image. No repository CI workflow is present.
 
 ## Configuration & Runtime
 
