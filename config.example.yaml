@@ -12,6 +12,11 @@ postgres:
   # Строка подключения к PostgreSQL.
   dsn: "postgres://fias:fias@localhost:5432/fias?sslmode=disable"
 
+rabbitmq:
+  # Оставьте url пустым, чтобы отключить публикацию событий.
+  url: "amqp://fias:fias@localhost:5672/"
+  queue: "fias.download.completed"
+
 source:
   # Адрес перечня версий ФИАС/ГАР.
   url: "https://fias.nalog.ru/WebServices/Public/GetAllDownloadFileInfo"

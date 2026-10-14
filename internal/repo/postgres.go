@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS version_info (
     UNIQUE (version_id, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_version_info_kind_status ON version_info (kind, status);
+CREATE TABLE IF NOT EXISTS download_events (
+    id BIGSERIAL PRIMARY KEY,
+    version_info_id BIGINT NOT NULL REFERENCES version_info(id),
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_download_events_pending ON download_events(id) WHERE published_at IS NULL;
 `
 	_, err := r.db.ExecContext(ctx, ddl)
 	if err != nil {
@@ -188,12 +196,46 @@ WHERE id = $1`
 
 // MarkCompleted помечает загрузку завершённой успешно.
 func (r *Repo) MarkCompleted(ctx context.Context, id int64, totalBytes int64, checksum string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	const q = `
 UPDATE version_info
 SET status = $2, total_bytes = $3, downloaded_bytes = $3, checksum = $4,
     completed_at = now(), last_error = '', updated_at = now()
-WHERE id = $1`
-	_, err := r.db.ExecContext(ctx, q, id, model.StatusCompleted, totalBytes, checksum)
+WHERE id = $1
+RETURNING version_id, kind, file_path, completed_at`
+	var versionID int64
+	var kind, path string
+	var completedAt time.Time
+	if err := tx.QueryRowContext(ctx, q, id, model.StatusCompleted, totalBytes, checksum).Scan(&versionID, &kind, &path, &completedAt); err != nil {
+		return err
+	}
+	const event = `INSERT INTO download_events (version_info_id, payload)
+VALUES ($1, jsonb_build_object('event', 'download.completed', 'version_id', $2::bigint,
+  'kind', $3::text, 'file_path', $4::text, 'total_bytes', $5::bigint,
+  'sha256', $6::text, 'completed_at', $7::timestamptz))`
+	if _, err := tx.ExecContext(ctx, event, id, versionID, kind, path, totalBytes, checksum, completedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type DownloadEvent struct {
+	ID      int64
+	Payload []byte
+}
+
+func (r *Repo) NextDownloadEvent(ctx context.Context) (DownloadEvent, error) {
+	var event DownloadEvent
+	err := r.db.QueryRowContext(ctx, `SELECT id, payload FROM download_events WHERE published_at IS NULL ORDER BY id LIMIT 1`).Scan(&event.ID, &event.Payload)
+	return event, err
+}
+
+func (r *Repo) MarkEventPublished(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE download_events SET published_at = now() WHERE id = $1`, id)
 	return err
 }
 

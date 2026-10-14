@@ -45,6 +45,12 @@ type Config struct {
 	Download  DownloadConfig  `yaml:"download"`
 	HTTP      HTTPConfig      `yaml:"http"`
 	Scheduler SchedulerConfig `yaml:"scheduler"`
+	RabbitMQ  RabbitMQConfig  `yaml:"rabbitmq"`
+}
+
+type RabbitMQConfig struct {
+	URL   string `yaml:"url"`
+	Queue string `yaml:"queue"`
 }
 
 type PostgresConfig struct {
@@ -104,6 +110,7 @@ func defaults() Config {
 		Scheduler: SchedulerConfig{
 			PollInterval: Duration{6 * time.Hour},
 		},
+		RabbitMQ: RabbitMQConfig{Queue: "fias.download.completed"},
 	}
 }
 
@@ -141,6 +148,9 @@ func (c Config) validate() error {
 	}
 	if c.Scheduler.PollInterval.Duration <= 0 {
 		return fmt.Errorf("scheduler.poll_interval must be a positive duration")
+	}
+	if c.RabbitMQ.URL != "" && c.RabbitMQ.Queue == "" {
+		return fmt.Errorf("rabbitmq.queue is required when rabbitmq.url is set")
 	}
 	return nil
 }

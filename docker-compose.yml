@@ -18,11 +18,32 @@ services:
     networks:
       - fias-downloader-network
 
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: fias
+      RABBITMQ_DEFAULT_PASS: fias
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - fias-downloader-network
+
   fias-downloader:
     image: fias-downloader-fias-downloader
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     volumes:
       - ./deploy/config.docker.yaml:/app/config.yaml:ro
@@ -71,6 +92,7 @@ volumes:
   pgdata:
   prometheus-data:
   grafana-data:
+  rabbitmq-data:
 
 networks:
   fias-downloader-network:
